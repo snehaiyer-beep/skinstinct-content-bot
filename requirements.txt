@@ -1,0 +1,4 @@
+google-genai>=0.3.0
+python-telegram-bot>=21.0,<22
+python-dotenv>=1.0.0
+tenacity>=8.2.0
