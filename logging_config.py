@@ -19,7 +19,6 @@ class RedactSecretsFilter(logging.Filter):
 
 
 def configure_logging() -> None:
-    LOGS_DIR.mkdir(exist_ok=True)
     root = logging.getLogger()
     root.setLevel(settings.log_level)
 
@@ -27,19 +26,26 @@ def configure_logging() -> None:
         "%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    file_handler = RotatingFileHandler(
-        LOGS_DIR / "bot.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
-    )
-    file_handler.setFormatter(fmt)
-    file_handler.addFilter(RedactSecretsFilter())
-
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(fmt)
     console_handler.addFilter(RedactSecretsFilter())
 
     root.handlers.clear()
-    root.addHandler(file_handler)
     root.addHandler(console_handler)
+
+    # File logging is best-effort: Vercel's filesystem is read-only outside
+    # /tmp, so this silently falls back to console-only there — Vercel
+    # already captures stdout as runtime logs, so nothing is lost.
+    try:
+        LOGS_DIR.mkdir(exist_ok=True)
+        file_handler = RotatingFileHandler(
+            LOGS_DIR / "bot.log", maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8"
+        )
+        file_handler.setFormatter(fmt)
+        file_handler.addFilter(RedactSecretsFilter())
+        root.addHandler(file_handler)
+    except OSError:
+        root.info("File logging unavailable (read-only filesystem) — using console only.")
 
     # noisy third-party loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
