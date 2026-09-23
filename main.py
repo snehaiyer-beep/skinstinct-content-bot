@@ -1,4 +1,7 @@
-"""Entrypoint — wires up logging, the database, and Telegram polling."""
+"""Local-development entrypoint: Telegram polling instead of webhooks, so you
+don't need a public URL to test against. Talks to the same Supabase database
+as the Vercel deployment (api/index.py) — never run both against the same bot
+token at once, Telegram only delivers each update to one of them."""
 import logging
 
 import db

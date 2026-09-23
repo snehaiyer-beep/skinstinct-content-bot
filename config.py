@@ -12,7 +12,6 @@ load_dotenv()
 BASE_DIR = Path(__file__).resolve().parent
 VOICE_SKILLS_DIR = BASE_DIR / "voice_skills"
 LOGS_DIR = BASE_DIR / "logs"
-DB_PATH = BASE_DIR / "content.db"
 
 
 @dataclass(frozen=True)
@@ -26,6 +25,14 @@ class Settings:
     telegram_bot_token: str = field(default_factory=lambda: os.environ.get("TELEGRAM_BOT_TOKEN", ""))
     telegram_admin_chat_id: str = field(default_factory=lambda: os.environ.get("TELEGRAM_ADMIN_CHAT_ID", ""))
     telegram_channel_id: str = field(default_factory=lambda: os.environ.get("TELEGRAM_CHANNEL_ID", ""))
+    telegram_webhook_secret: str = field(
+        default_factory=lambda: os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+    )
+
+    supabase_url: str = field(default_factory=lambda: os.environ.get("SUPABASE_URL", ""))
+    supabase_service_key: str = field(default_factory=lambda: os.environ.get("SUPABASE_SERVICE_KEY", ""))
+
+    public_url: str = field(default_factory=lambda: os.environ.get("PUBLIC_URL", ""))
 
     active_voice_skill: str = field(
         default_factory=lambda: os.environ.get("ACTIVE_VOICE_SKILL", "meera_skinstinct")
@@ -55,6 +62,18 @@ class Settings:
         ]
         if missing:
             raise RuntimeError(f"Missing required Telegram settings: {', '.join(missing)}")
+
+    def require_supabase(self) -> None:
+        missing = [
+            name
+            for name, val in (
+                ("SUPABASE_URL", self.supabase_url),
+                ("SUPABASE_SERVICE_KEY", self.supabase_service_key),
+            )
+            if not val
+        ]
+        if missing:
+            raise RuntimeError(f"Missing required Supabase settings: {', '.join(missing)}")
 
 
 settings = Settings()

@@ -1,14 +1,11 @@
 """
 Exercises the full generate -> validate -> regenerate loop with a fake Gemini
-client (no network, no API key) so the pipeline's control flow can be proven
-correct before real keys exist.
+client AND a fake in-memory db (no network, no API key, no Supabase project
+needed) so the pipeline's control flow can be proven correct in isolation.
 """
-import tempfile
 import unittest
-from pathlib import Path
 from unittest.mock import patch
 
-import db
 from services import pipeline
 
 GOOD_BODY = (
@@ -37,16 +34,43 @@ class FakeGeminiClient:
         return self._responses.pop(0)
 
 
+class FakeDB:
+    """Replaces db.py's Supabase calls with an in-memory dict, keyed like the
+    real table's `id` column, so pipeline tests don't need a live Supabase
+    project or network access."""
+
+    def __init__(self):
+        self._rows: dict[int, dict] = {}
+        self._next_id = 1
+
+    def save_draft(self, **kwargs) -> int:
+        content_id = self._next_id
+        self._next_id += 1
+        self._rows[content_id] = {"id": content_id, **kwargs}
+        return content_id
+
+    def update_status(self, content_id, status, telegram_message_id=None) -> None:
+        self._rows[content_id]["status"] = status
+
+    def get_item(self, content_id):
+        return self._rows.get(content_id)
+
+    def recent_summaries(self, voice_skill, platform, limit=5):
+        return []
+
+
 class TestPipelineDryRun(unittest.TestCase):
     def setUp(self):
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self._orig_db_path = db.DB_PATH
-        db.DB_PATH = Path(self._tmpdir.name) / "test.db"
-        db.init_db()
-
-    def tearDown(self):
-        db.DB_PATH = self._orig_db_path
-        self._tmpdir.cleanup()
+        self.fake_db = FakeDB()
+        patcher = patch.multiple(
+            "services.pipeline.db",
+            save_draft=self.fake_db.save_draft,
+            update_status=self.fake_db.update_status,
+            get_item=self.fake_db.get_item,
+            recent_summaries=self.fake_db.recent_summaries,
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_passes_on_first_attempt(self):
         fake = FakeGeminiClient(
@@ -69,7 +93,7 @@ class TestPipelineDryRun(unittest.TestCase):
         self.assertTrue(result.passed)
         self.assertEqual(result.attempts, 1)
         self.assertIsNotNone(result.content_id)
-        saved = db.get_item(result.content_id)
+        saved = self.fake_db.get_item(result.content_id)
         self.assertEqual(saved["status"], "draft")
 
     def test_regenerates_after_deterministic_failure_then_passes(self):
@@ -113,7 +137,7 @@ class TestPipelineDryRun(unittest.TestCase):
                 category="ingredient", platform="linkedin", topic="vitamin C stability",
             )
         self.assertFalse(result.passed)
-        saved = db.get_item(result.content_id)
+        saved = self.fake_db.get_item(result.content_id)
         self.assertEqual(saved["status"], "failed")
 
 
