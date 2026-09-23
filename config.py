@@ -17,7 +17,7 @@ LOGS_DIR = BASE_DIR / "logs"
 @dataclass(frozen=True)
 class Settings:
     gemini_api_key: str = field(default_factory=lambda: os.environ.get("GEMINI_API_KEY", ""))
-    gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-2.5-flash"))
+    gemini_model: str = field(default_factory=lambda: os.environ.get("GEMINI_MODEL", "gemini-3.6-flash"))
     gemini_temperature: float = field(
         default_factory=lambda: float(os.environ.get("GEMINI_TEMPERATURE", "0.85"))
     )
