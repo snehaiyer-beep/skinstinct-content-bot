@@ -17,6 +17,8 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
 from tenacity import retry, stop_after_attempt, wait_exponential_jitter
 
@@ -55,13 +57,31 @@ def _approval_keyboard(content_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def _format_note_draft_message(result: pipeline.NotePipelineResult) -> str:
+    header = f"Draft #{result.content_id} — {result.platform}\n"
+    header += f"Note score: {result.score}/10 — {result.score_reason}\n"
+    if result.subject_line:
+        header += f"Subject: {result.subject_line}\n"
+    header += f"Attempts: {result.attempts}\n"
+    if result.used_news_item:
+        header += "News angle used — verify the source block at the end before publishing.\n"
+    if result.warnings:
+        header += f"Warnings: {'; '.join(result.warnings)}\n"
+    header += "\nReply APPROVE or REJECT to this message, or use the buttons below.\n\n---\n\n"
+    return header + result.body
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Skinstinct content bot.\n\n"
+        "Just send me a note (plain message, no command) and I'll score it, look "
+        "for a relevant news angle, and draft a post if it's substantive enough.\n\n"
+        "Or use structured commands:\n"
         "/generate <category> | <topic> — draft a LinkedIn post\n"
         "/newsletter <category> | <topic> — draft a newsletter\n"
         "/status — pending drafts\n"
         "/history — recent items\n\n"
+        "On any draft: reply APPROVE or REJECT to this chat, or use the buttons.\n\n"
         "Categories: ingredient, founder_story, india_context, industry_transparency, "
         "formulation_science, brand_philosophy, consumer_education"
     )
@@ -103,11 +123,16 @@ async def _run_generation(update: Update, platform: str, args: list[str]) -> Non
     if not result.passed:
         text = "NEEDS HUMAN REVIEW (failed validation after max attempts)\n\n" + text
 
+    sent_message = None
     for i in range(0, len(text), TELEGRAM_MESSAGE_LIMIT):
         chunk = text[i : i + TELEGRAM_MESSAGE_LIMIT]
         is_last = i + TELEGRAM_MESSAGE_LIMIT >= len(text)
-        await update.message.reply_text(
+        sent_message = await update.message.reply_text(
             chunk, reply_markup=_approval_keyboard(result.content_id) if is_last else None
+        )
+    if sent_message is not None and result.content_id is not None:
+        await asyncio.to_thread(
+            db.update_status, result.content_id, "pending", telegram_message_id=sent_message.message_id
         )
     await status_msg.delete()
 
@@ -118,6 +143,87 @@ async def cmd_generate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def cmd_newsletter(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _run_generation(update, "newsletter", context.args)
+
+
+async def _run_note_generation(update: Update, note_text: str) -> None:
+    status_msg = await update.message.reply_text("Reading your note...")
+
+    try:
+        result = await asyncio.to_thread(
+            pipeline.generate_from_note, note_text, channel_id=settings.telegram_channel_id or None,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Note pipeline failed")
+        await status_msg.edit_text(f"Something went wrong processing that note: {exc}")
+        return
+
+    if not result.accepted:
+        await status_msg.edit_text(
+            f"No draft made — note scored {result.score}/10 (need 6+).\nWhy: {result.score_reason}"
+        )
+        return
+
+    text = _format_note_draft_message(result)
+    if not result.passed_validation:
+        text = "NEEDS HUMAN REVIEW (failed validation after max attempts)\n\n" + text
+
+    sent_message = None
+    for i in range(0, len(text), TELEGRAM_MESSAGE_LIMIT):
+        chunk = text[i : i + TELEGRAM_MESSAGE_LIMIT]
+        is_last = i + TELEGRAM_MESSAGE_LIMIT >= len(text)
+        sent_message = await update.message.reply_text(
+            chunk, reply_markup=_approval_keyboard(result.content_id) if is_last else None
+        )
+    if sent_message is not None and result.content_id is not None:
+        await asyncio.to_thread(
+            db.update_status, result.content_id, "pending", telegram_message_id=sent_message.message_id
+        )
+    await status_msg.delete()
+
+
+async def on_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if message is None or not message.text:
+        return
+
+    reply_to = message.reply_to_message
+    if reply_to is not None:
+        decision = message.text.strip().upper()
+        if decision in ("APPROVE", "REJECT"):
+            draft = await asyncio.to_thread(db.get_draft_by_telegram_message, str(reply_to.message_id))
+            if draft is None:
+                await message.reply_text(
+                    "Couldn't find a draft attached to that message — reply directly to "
+                    "the bot's draft message to approve/reject it."
+                )
+                return
+
+            content_id = draft["id"]
+            if decision == "APPROVE":
+                if not settings.telegram_channel_id:
+                    await message.reply_text(
+                        "TELEGRAM_CHANNEL_ID is not configured — cannot publish. Marked approved."
+                    )
+                    await asyncio.to_thread(db.update_status, content_id, "approved")
+                    return
+                try:
+                    published_id = await _publish_to_channel(
+                        context.application, draft["body"], draft["subject_line"]
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("Publish failed after retries")
+                    await message.reply_text(f"Publish failed after retries: {exc}")
+                    return
+                await asyncio.to_thread(
+                    db.update_status, content_id, "published", telegram_message_id=published_id
+                )
+                await message.reply_text(f"Draft #{content_id} approved and published.")
+            else:
+                await asyncio.to_thread(db.update_status, content_id, "rejected")
+                await message.reply_text(f"Draft #{content_id} rejected.")
+            return
+
+    await _run_note_generation(update, message.text)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -178,18 +284,47 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     elif action == "regen":
         await query.edit_message_text(query.message.text + "\n\n[Regenerating...]")
+        note_id = item.get("note_id")
         try:
-            result = await asyncio.to_thread(
-                pipeline.generate_content, category=item["category"], platform=item["platform"],
-                topic=item["topic"], channel_id=item["channel_id"],
-            )
+            if note_id:
+                note = await asyncio.to_thread(db.get_note, note_id)
+                note_text = note["text"] if note else item["topic"]
+                result = await asyncio.to_thread(
+                    pipeline.generate_from_note, note_text, platform=item["platform"],
+                    channel_id=item["channel_id"],
+                )
+                passed = result.accepted and result.passed_validation
+                text = (
+                    f"No draft made on regenerate — note scored {result.score}/10.\n"
+                    f"Why: {result.score_reason}"
+                    if not result.accepted
+                    else _format_note_draft_message(result)
+                )
+                new_content_id = result.content_id
+            else:
+                result = await asyncio.to_thread(
+                    pipeline.generate_content, category=item["category"], platform=item["platform"],
+                    topic=item["topic"], channel_id=item["channel_id"],
+                )
+                passed = result.passed
+                text = _format_draft_message(result)
+                new_content_id = result.content_id
         except Exception as exc:  # noqa: BLE001
             logger.exception("Regeneration failed")
             await query.message.reply_text(f"Regeneration failed: {exc}")
             return
+
         db.update_status(content_id, "rejected")
-        text = _format_draft_message(result)
-        await query.message.reply_text(text, reply_markup=_approval_keyboard(result.content_id))
+        if not passed and new_content_id is None:
+            await query.message.reply_text(text)
+            return
+        sent = await query.message.reply_text(
+            text, reply_markup=_approval_keyboard(new_content_id) if new_content_id else None
+        )
+        if new_content_id is not None:
+            await asyncio.to_thread(
+                db.update_status, new_content_id, "pending", telegram_message_id=sent.message_id
+            )
 
     elif action == "reject":
         db.update_status(content_id, "rejected")
@@ -218,5 +353,6 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_message))
     app.add_error_handler(on_error)
     return app

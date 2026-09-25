@@ -58,6 +58,18 @@ class FakeDB:
     def recent_summaries(self, voice_skill, platform, limit=5):
         return []
 
+    def save_note(self, **kwargs) -> int:
+        note_id = self._next_id
+        self._next_id += 1
+        self._rows[("note", note_id)] = {"id": note_id, **kwargs}
+        return note_id
+
+    def update_note_score(self, note_id, **kwargs) -> None:
+        self._rows[("note", note_id)].update(kwargs)
+
+    def get_note(self, note_id):
+        return self._rows.get(("note", note_id))
+
 
 class TestPipelineDryRun(unittest.TestCase):
     def setUp(self):
@@ -94,7 +106,7 @@ class TestPipelineDryRun(unittest.TestCase):
         self.assertEqual(result.attempts, 1)
         self.assertIsNotNone(result.content_id)
         saved = self.fake_db.get_item(result.content_id)
-        self.assertEqual(saved["status"], "draft")
+        self.assertEqual(saved["status"], "pending")
 
     def test_regenerates_after_deterministic_failure_then_passes(self):
         fake = FakeGeminiClient(
